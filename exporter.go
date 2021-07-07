@@ -15,6 +15,77 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+type PeersGenerated struct {
+	Jsonrpc string `json:"jsonrpc"`
+	ID      int    `json:"id"`
+	Result  struct {
+		Listening bool     `json:"listening"`
+		Listeners []string `json:"listeners"`
+		NPeers    string   `json:"n_peers"`
+		Peers     []struct {
+			NodeInfo struct {
+				ProtocolVersion struct {
+					P2P   string `json:"p2p"`
+					Block string `json:"block"`
+					App   string `json:"app"`
+				} `json:"protocol_version"`
+				ID         string `json:"id"`
+				ListenAddr string `json:"listen_addr"`
+				Network    string `json:"network"`
+				Version    string `json:"version"`
+				Channels   string `json:"channels"`
+				Moniker    string `json:"moniker"`
+				Other      struct {
+					TxIndex    string `json:"tx_index"`
+					RPCAddress string `json:"rpc_address"`
+				} `json:"other"`
+			} `json:"node_info"`
+			IsOutbound       bool `json:"is_outbound"`
+			ConnectionStatus struct {
+				Duration    string `json:"Duration"`
+				SendMonitor struct {
+					Start    time.Time `json:"Start"`
+					Bytes    string    `json:"Bytes"`
+					Samples  string    `json:"Samples"`
+					InstRate string    `json:"InstRate"`
+					CurRate  string    `json:"CurRate"`
+					AvgRate  string    `json:"AvgRate"`
+					PeakRate string    `json:"PeakRate"`
+					BytesRem string    `json:"BytesRem"`
+					Duration string    `json:"Duration"`
+					Idle     string    `json:"Idle"`
+					TimeRem  string    `json:"TimeRem"`
+					Progress int       `json:"Progress"`
+					Active   bool      `json:"Active"`
+				} `json:"SendMonitor"`
+				RecvMonitor struct {
+					Start    time.Time `json:"Start"`
+					Bytes    string    `json:"Bytes"`
+					Samples  string    `json:"Samples"`
+					InstRate string    `json:"InstRate"`
+					CurRate  string    `json:"CurRate"`
+					AvgRate  string    `json:"AvgRate"`
+					PeakRate string    `json:"PeakRate"`
+					BytesRem string    `json:"BytesRem"`
+					Duration string    `json:"Duration"`
+					Idle     string    `json:"Idle"`
+					TimeRem  string    `json:"TimeRem"`
+					Progress int       `json:"Progress"`
+					Active   bool      `json:"Active"`
+				} `json:"RecvMonitor"`
+				Channels []struct {
+					ID                int    `json:"ID"`
+					SendQueueCapacity string `json:"SendQueueCapacity"`
+					SendQueueSize     string `json:"SendQueueSize"`
+					Priority          string `json:"Priority"`
+					RecentlySent      string `json:"RecentlySent"`
+				} `json:"Channels"`
+			} `json:"connection_status"`
+			RemoteIP string `json:"remote_ip"`
+		} `json:"peers"`
+	} `json:"result"`
+}
+
 type ProtocolVersion struct {
   P2p	string `json:"p2p"`
   Block string `json:"block"`
@@ -73,10 +144,11 @@ type Message struct {
 }
 
 const namespace = "cosmos"
-const url = "/status"
+const url_status = "/status"
+const url_peers = "/net_info"
 
 var (
-	client = &http.Client{Timeout: 10 * time.Second}
+	client = &http.Client{Timeout: 5 * time.Second}
 	listenAddress = flag.String("web.listen-address", ":9141",
 		"Address to listen on for telemetry")
 	metricsPath = flag.String("web.telemetry-path", "/metrics",
@@ -98,6 +170,11 @@ var (
 		"Time difference",
 		[]string{"node"}, nil,
 	)
+	peersNum = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "peers_num"),
+		"Peers number",
+		[]string{"node"}, nil,
+	)
 )
 
 type Exporter struct {
@@ -114,15 +191,34 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- up
 	ch <- latestBlockHeight
 	ch <- timeDiff
+	ch <- peersNum
 }
 
-func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
+func (e *Exporter) Scrape(url string) ([]byte, error) {
 	req, err := http.NewRequest("GET", e.cosmosEndpoint+url, nil)
 	if err != nil {
-		log.Fatal(err)
+		log.Println(err)
+                return nil, err
 	}
 
 	resp, err := client.Do(req)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		log.Fatal(err)
+		return nil, err
+	}
+
+        return body, err
+}
+
+func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
+        body, err := e.Scrape(url_status)
 	if err != nil {
 		ch <- prometheus.MustNewConstMetric(
 			up, prometheus.GaugeValue, 0,
@@ -130,15 +226,10 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		log.Println(err)
 		return
 	}
+
 	ch <- prometheus.MustNewConstMetric(
 		up, prometheus.GaugeValue, 1,
 	)
-
-	body, err := ioutil.ReadAll(resp.Body)
-	resp.Body.Close()
-	if err != nil {
-		log.Fatal(err)
-	}
 
         message := Message{}
         jsonErr := json.Unmarshal(body, &message)
@@ -162,7 +253,22 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	channeltimeDiff, _ := strconv.ParseFloat(strconv.FormatInt(diff, 10), 64)
         ch <- prometheus.MustNewConstMetric(timeDiff, prometheus.GaugeValue, channeltimeDiff, "localhost")
 
-	log.Println("Endpoint scraped")
+        body, err = e.Scrape(url_peers)
+        if err != nil {
+                log.Println(err)
+                return
+        }
+
+        peers := PeersGenerated{}
+        jsonErr = json.Unmarshal(body, &peers)
+	if jsonErr != nil {
+		log.Fatal(jsonErr)
+	}
+
+	channelpeersNum, _ := strconv.ParseFloat(peers.Result.NPeers, 64)
+	ch <- prometheus.MustNewConstMetric(peersNum, prometheus.GaugeValue, channelpeersNum, "localhost")
+
+	log.Println("Endpoints scraped")
 }
 
 func main() {
